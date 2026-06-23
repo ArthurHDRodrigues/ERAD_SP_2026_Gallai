@@ -3,18 +3,16 @@
 #include <string.h>
 #include <omp.h>
 
-// Função auxiliar para escrever o caminho em um buffer de string na memória
-// Retorna a quantidade de caracteres escritos
-int sprint_path_yaml(char* buffer, int* path, int len) {
-    int pos = 0;
-    pos += sprintf(buffer + pos, "\"");
+// Função auxiliar para escrever o caminho no YAML (Inalterada)
+void print_path_yaml(FILE* out, int* path, int len) {
+    fprintf(out, "\"");
     for (int i = 0; i < len; i++) {
-        pos += sprintf(buffer + pos, "%d%s", path[i], (i < len - 1) ? " -> " : "");
+        fprintf(out, "%d%s", path[i], (i < len - 1) ? " -> " : "");
     }
-    pos += sprintf(buffer + pos, "\"\n");
-    return pos;
+    fprintf(out, "\"\n");
 }
 
+// A recursão pura não sofre alterações, o isolamento ocorre na função chamadora
 void dfs_longest_path(int u, int** adj, int* visited, int* current_path, int current_len, 
                       int* max_local, int* max_len, int n, int skip_vertex, int target_len) {
     if (*max_len == target_len) return;
@@ -46,35 +44,64 @@ void dfs_longest_path(int u, int** adj, int* visited, int* current_path, int cur
     visited[u] = 0;
 }
 
+// PARALELISMO 2.A: Busca do caminho base
 int* find_longest_path(int** adj, int n, int skip_vertex, int* out_len) {
     if (n <= 0) {
         *out_len = 0;
         return NULL;
     }
 
-    int* max_local = (int*)malloc(n * sizeof(int));
-    int* current_path = (int*)malloc(n * sizeof(int));
-    int* visited = (int*)calloc(n, sizeof(int));
-    
-    int max_len = 0;
+    int global_max_len = 0;
+    int* global_max_path = (int*)malloc(n * sizeof(int));
     int target_len = (skip_vertex == -1) ? n : n - 1;
+    
+    // Flag volátil para comunicação entre threads. Se 1, todas abortam a busca.
+    volatile int found_target = 0; 
 
-    for (int i = 0; i < n; i++) {
-        if (i == skip_vertex) continue;
-        dfs_longest_path(i, adj, visited, current_path, 0, max_local, &max_len, n, skip_vertex, target_len);
-        if (max_len == target_len) break;
+    // Cria a região paralela
+    #pragma omp parallel
+    {
+        // Memória Thread-Local: Cada thread precisa das suas próprias variáveis de estado
+        int* local_max_path = (int*)malloc(n * sizeof(int));
+        int* current_path = (int*)malloc(n * sizeof(int));
+        int* visited = (int*)calloc(n, sizeof(int));
+        int local_max_len = 0;
+
+        // Divide os vértices raiz da busca entre as threads
+        #pragma omp for schedule(dynamic)
+        for (int i = 0; i < n; i++) {
+            if (found_target) continue; // Early exit check simulando um "break"
+            if (i == skip_vertex) continue;
+
+            dfs_longest_path(i, adj, visited, current_path, 0, local_max_path, &local_max_len, n, skip_vertex, target_len);
+
+            if (local_max_len == target_len) {
+                found_target = 1; // Avisa as outras threads
+            }
+        }
+
+        // Seção crítica: apenas uma thread atualiza o recorde global por vez
+        #pragma omp critical
+        {
+            if (local_max_len > global_max_len) {
+                global_max_len = local_max_len;
+                memcpy(global_max_path, local_max_path, local_max_len * sizeof(int));
+            }
+        }
+
+        // Limpeza Thread-Local
+        free(local_max_path);
+        free(current_path);
+        free(visited);
     }
 
-    free(current_path);
-    free(visited);
-
-    *out_len = max_len;
-    return max_local;
+    *out_len = global_max_len;
+    return global_max_path;
 }
 
+// Parse g6 (Inalterado)
 int** parse_graph6_3regular(const char* g6_str, int* n_out) {
     int n = 0, char_idx = 0;
-
     if (g6_str[0] == 126) {
         n = ((g6_str[1] - 63) << 12) | ((g6_str[2] - 63) << 6) | (g6_str[3] - 63);
         char_idx = 4;
@@ -98,12 +125,10 @@ int** parse_graph6_3regular(const char* g6_str, int* n_out) {
     for (int i = 1; i < n; i++) {
         for (int j = 0; j < i; j++) {
             int bit = (current_char_val >> bit_idx) & 1;
-
             if (bit == 1) {
                 if (current_degree[i] < 3) adj[i][current_degree[i]++] = j;
                 if (current_degree[j] < 3) adj[j][current_degree[j]++] = i;
             }
-
             bit_idx--;
             if (bit_idx < 0) {
                 bit_idx = 5;
@@ -118,9 +143,6 @@ int** parse_graph6_3regular(const char* g6_str, int* n_out) {
     return adj;
 }
 
-
-#define CHUNK_SIZE 100000 // Tamanho do lote (processa 100 mil grafos por vez)
-
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         printf("Uso: %s <arquivo_de_entrada.g6>\n", argv[0]);
@@ -134,7 +156,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Geração do nome do arquivo YAML
     char yaml_filename[256];
     strncpy(yaml_filename, input_filename, sizeof(yaml_filename)-1);
     yaml_filename[255] = '\0';
@@ -144,131 +165,104 @@ int main(int argc, char* argv[]) {
 
     FILE* yaml_out = fopen(yaml_filename, "w");
     if (!yaml_out) {
-        perror("Erro ao criar o arquivo YAML final");
+        perror("Erro ao criar o arquivo YAML");
         fclose(file);
         return 1;
     }
 
-    // Arrays de tamanho fixo para o lote atual
-    char** lines = (char**)malloc(CHUNK_SIZE * sizeof(char*));
-    char** yaml_results = (char**)calloc(CHUNK_SIZE, sizeof(char*));
-    char file_buffer[100000];
+    char buffer[100000];
+    
+    // Processamento sequencial do arquivo (Linha a Linha)
+    while (fgets(buffer, sizeof(buffer), file)) {
+        buffer[strcspn(buffer, "\r\n")] = '\0';
+        if (strlen(buffer) == 0) continue;
 
-    long long total_processed = 0;
-    int eof_reached = 0;
+        int n = 0;
+        int** adj = parse_graph6_3regular(buffer, &n);
 
-    printf("Iniciando processamento em lotes de %d grafos...\n", CHUNK_SIZE);
+        // a) Encontra o caminho base de forma paralela (Nível 2.A aplicado dentro da função)
+        int p = 0;
+        int* P = find_longest_path(adj, n, -1, &p);
 
-    while (!eof_reached) {
-        int num_lines = 0;
+        fprintf(yaml_out, "- graph6: \"%s\"\n", buffer);
+        fprintf(yaml_out, "  certificate:\n");
 
-        // 1. Carrega o lote atual para a memória
-        while (num_lines < CHUNK_SIZE && fgets(file_buffer, sizeof(file_buffer), file)) {
-            file_buffer[strcspn(file_buffer, "\r\n")] = '\0';
-            if (strlen(file_buffer) == 0) continue;
+        if (p == n) {
+            fprintf(yaml_out, "    type: hamiltonian\n");
+            fprintf(yaml_out, "    proof: ");
+            print_path_yaml(yaml_out, P, p);
+        } else {
+            // Flags voláteis compartilhadas para interrupção do loop
+            volatile int is_gallai = 0;
+            int gallai_v = -1;
+            
+            int** alt_paths = (int**)calloc(p, sizeof(int*));
+            int* alt_lens = (int*)malloc(p * sizeof(int));
 
-            lines[num_lines] = strdup(file_buffer);
-            num_lines++;
-        }
+            // PARALELISMO 2.B: Verificação dos vértices de Gallai
+            // Nota: Por padrão o OpenMP não aninha paralelismo (nested parallelism). 
+            // Portanto, a chamada de 'find_longest_path' aqui dentro rodará sequencialmente
+            // para cada thread deste loop, distribuindo a carga perfeitamente sem explosão de threads.
+            #pragma omp parallel for schedule(dynamic)
+            for (int k = 0; k < p; k++) {
+                if (is_gallai) continue; // Simula o "break" se outra thread já achou um Gallai
 
-        if (num_lines < CHUNK_SIZE) {
-            eof_reached = 1; // Fim do arquivo detectado
-        }
+                int v = P[k];
+                int p_prime = 0;
+                int* P_prime = find_longest_path(adj, n, v, &p_prime);
 
-        if (num_lines == 0) break;
-
-        // 2. Processa o lote atual paralelamente
-        #pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < num_lines; i++) {
-            int n = 0;
-            int** adj = parse_graph6_3regular(lines[i], &n);
-
-            int p = 0;
-            int* P = find_longest_path(adj, n, -1, &p);
-
-            char local_yaml_buf[1048576]; // 1MB buffer por thread
-            int pos = 0;
-
-            pos += sprintf(local_yaml_buf + pos, "- graph6: \"%s\"\n  certificate:\n", lines[i]);
-
-            if (p == n) {
-                pos += sprintf(local_yaml_buf + pos, "    type: hamiltonian\n    proof: ");
-                pos += sprint_path_yaml(local_yaml_buf + pos, P, p);
-            } else {
-                int is_gallai = 0;
-                int gallai_v = -1;
-                int** alt_paths = (int**)calloc(p, sizeof(int*));
-                int* alt_lens = (int*)malloc(p * sizeof(int));
-
-                for (int k = 0; k < p; k++) {
-                    int v = P[k];
-                    int p_prime = 0;
-                    int* P_prime = find_longest_path(adj, n, v, &p_prime);
-
-                    if (p_prime < p) {
-                        is_gallai = 1;
-                        gallai_v = v;
-                        free(P_prime);
-                        break;
-                    } else {
-                        alt_paths[k] = P_prime;
-                        alt_lens[k] = p_prime;
+                if (p_prime < p) {
+                    // Proteção na escrita da flag de condição de parada
+                    #pragma omp critical
+                    {
+                        if (!is_gallai) { // Double check pattern
+                            is_gallai = 1;
+                            gallai_v = v;
+                        }
                     }
-                }
-
-                if (is_gallai) {
-                    pos += sprintf(local_yaml_buf + pos, "    type: gallai\n    proof:\n");
-                    pos += sprintf(local_yaml_buf + pos, "      vertex: %d\n", gallai_v);
-                    pos += sprintf(local_yaml_buf + pos, "      longest_path_length: %d\n", p);
-                    pos += sprintf(local_yaml_buf + pos, "      base_longest_path: ");
-                    pos += sprint_path_yaml(local_yaml_buf + pos, P, p);
-
-                    for(int k = 0; k < p; k++) {
-                        if (alt_paths[k]) free(alt_paths[k]);
-                    }
+                    free(P_prime);
                 } else {
-                    pos += sprintf(local_yaml_buf + pos, "    type: nogallai\n    proof:\n");
-                    pos += sprintf(local_yaml_buf + pos, "      base_longest_path: ");
-                    pos += sprint_path_yaml(local_yaml_buf + pos, P, p);
-                    pos += sprintf(local_yaml_buf + pos, "      alternative_paths:\n");
-
-                    for (int k = 0; k < p; k++) {
-                        pos += sprintf(local_yaml_buf + pos, "        %d: ", P[k]);
-                        pos += sprint_path_yaml(local_yaml_buf + pos, alt_paths[k], alt_lens[k]);
-                        free(alt_paths[k]);
-                    }
+                    alt_paths[k] = P_prime; // Escrita segura: cada thread altera um índice 'k' único
+                    alt_lens[k] = p_prime;
                 }
-                free(alt_paths);
-                free(alt_lens);
             }
 
-            yaml_results[i] = strdup(local_yaml_buf);
-
-            // Limpeza de memória do grafo atual
-            free(P);
-            for (int j = 0; j < n; j++) free(adj[j]);
-            free(adj);
+            if (is_gallai) {
+                fprintf(yaml_out, "    type: gallai\n");
+                fprintf(yaml_out, "    proof:\n");
+                fprintf(yaml_out, "      vertex: %d\n", gallai_v);
+                fprintf(yaml_out, "      longest_path_length: %d\n", p);
+                fprintf(yaml_out, "      base_longest_path: ");
+                print_path_yaml(yaml_out, P, p);
+                
+                for(int k = 0; k < p; k++) {
+                    if (alt_paths[k]) free(alt_paths[k]);
+                }
+            } else {
+                fprintf(yaml_out, "    type: nogallai\n");
+                fprintf(yaml_out, "    proof:\n");
+                fprintf(yaml_out, "      base_longest_path: ");
+                print_path_yaml(yaml_out, P, p);
+                fprintf(yaml_out, "      alternative_paths:\n");
+                
+                for (int k = 0; k < p; k++) {
+                    fprintf(yaml_out, "        %d: ", P[k]);
+                    print_path_yaml(yaml_out, alt_paths[k], alt_lens[k]);
+                    free(alt_paths[k]);
+                }
+            }
+            free(alt_paths);
+            free(alt_lens);
         }
 
-        // 3. Escreve sequencialmente o resultado do lote no disco e libera a memória
-        for (int i = 0; i < num_lines; i++) {
-            fprintf(yaml_out, "%s", yaml_results[i]);
-            free(lines[i]);
-            free(yaml_results[i]);
-            yaml_results[i] = NULL; // Prevenção de segurança
-        }
-
-        total_processed += num_lines;
-        printf("Progresso: %lld grafos processados...\n", total_processed);
+        free(P);
+        for (int i = 0; i < n; i++) free(adj[i]);
+        free(adj);
     }
 
-    // Limpeza final da estrutura de lotes
-    free(lines);
-    free(yaml_results);
+    printf("Relatorio gerado com sucesso: %s\n", yaml_filename);
+
     fclose(file);
     fclose(yaml_out);
-
-    printf("Concluido! Relatorio total gerado com sucesso: %s\n", yaml_filename);
     return 0;
 }
-
